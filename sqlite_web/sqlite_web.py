@@ -79,11 +79,11 @@ from playhouse.migrate import migrate
 try:
     from sqlite_web.executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        run_script_atomic, split_statements, wrap)
 except ImportError:
     from executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        run_script_atomic, split_statements, wrap)
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -504,6 +504,7 @@ def _query_view(template, table=None):
 
     export_format = None
     explain = False
+    preview = False
     if request.method == 'POST':
         if 'export_json' in request.form:
             export_format = 'json'
@@ -511,6 +512,8 @@ def _query_view(template, table=None):
             export_format = 'csv'
         elif 'explain' in request.form:
             explain = True
+        elif 'preview' in request.form:
+            preview = True
 
     ordering_key = 'export_ordering' if export_format else 'ordering'
     try:
@@ -568,6 +571,7 @@ def _query_view(template, table=None):
             return export(model_class.raw(qsql).dicts(), export_format, table)
 
     result = results = total = total_pages = None
+    script_committed = script_preview = script_ok = None
     rpp = app.config['QUERY_ROWS_PER_PAGE']
     if statements and export_format is None:
         if request.method == 'GET' and not single_read:
@@ -575,13 +579,18 @@ def _query_view(template, table=None):
             flash('Press Execute to run this statement.', 'info')
         elif explain and len(statements) > 1:
             flash('Only a single statement may be explained.', 'warning')
-        elif len(statements) == 1:
+        elif len(statements) == 1 and not preview:
             # EXPLAIN QUERY PLAN compiles the statement without running it.
             run_sql = 'EXPLAIN QUERY PLAN %s' % sql if explain else sql
             result = run_one(dataset, run_sql, page=page, page_size=rpp,
                              ordering=ordering)
         else:
-            results = run_script(dataset, statements, page_size=rpp)
+            # A script (or an explicit preview) runs as one atomic unit:
+            # it either applies in full or leaves the database untouched.
+            script_preview = preview
+            results, script_committed = run_script_atomic(
+                dataset, statements, page_size=rpp, commit=not preview)
+            script_ok = results[-1].kind != 'error'
 
     if (result is not None and result.kind == 'rows' and allow_detail and
             not explain and not is_composite_pk and
@@ -616,6 +625,9 @@ def _query_view(template, table=None):
         query_images=get_query_images(),
         result=result,
         results=results,
+        script_committed=script_committed,
+        script_ok=script_ok,
+        script_preview=script_preview,
         sql=sql,
         table=table,
         table_sql=dataset.cached_table_sql(table),

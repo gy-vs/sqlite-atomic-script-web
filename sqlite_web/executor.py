@@ -1,5 +1,7 @@
 import base64
 import json
+import re
+import time
 from dataclasses import dataclass, field
 
 from peewee import DatabaseError
@@ -16,6 +18,7 @@ class Result:
     has_next: bool = False
     affected: int = -1
     error: str = ''
+    elapsed: float = None  # Seconds the statement took to run.
 
 
 def wrap(sql, ordering=None, limit=None, offset=0, select='*'):
@@ -32,6 +35,14 @@ def wrap(sql, ordering=None, limit=None, offset=0, select='*'):
 
 
 def run_one(dataset, sql, page=1, page_size=50, ordering=None):
+    start = time.perf_counter()
+    result = _run_one(dataset, sql, page=page, page_size=page_size,
+                      ordering=ordering)
+    result.elapsed = time.perf_counter() - start
+    return result
+
+
+def _run_one(dataset, sql, page=1, page_size=50, ordering=None):
     # The query box allows whatever kinds of query/ies. We wrap the user query
     # to provide ordering + pagination, but cannot wrap DDL or DML statements.
     # Rather than try to parse the user SQL, attempt to wrap + execute (this
@@ -84,6 +95,68 @@ def run_script(dataset, statements, page_size=50):
         if result.kind == 'error':
             break
     return results
+
+
+# Transaction-control statements cannot run inside the transaction a script
+# executes in: BEGIN would error, and COMMIT/ROLLBACK would silently commit
+# or discard the statements that ran before them, breaking atomicity.
+TXN_CONTROL_RE = re.compile(
+    r'^\s*(?:begin|commit|rollback|end|savepoint|release)\b', re.I)
+
+
+def run_script_atomic(dataset, statements, page_size=50, commit=True):
+    """
+    Run a script as one atomic unit: either every statement applies or
+    none of them do. Returns (results, committed).
+
+    Statements run in order inside a single transaction, stopping at the
+    first error. With commit=False (a preview) the transaction always
+    rolls back, leaving the database untouched; the per-statement results
+    are the same ones a committing run produces, since both run the same
+    statements against the same starting state. If the connection drops
+    before commit, sqlite rolls the transaction back on close, so the
+    database can never be left half-applied.
+    """
+    for stmt in statements:
+        if TXN_CONTROL_RE.match(stmt):
+            error = ('Transaction-control statements cannot run inside a '
+                     'script; the script itself executes in a single '
+                     'transaction: %s' % stmt.strip())
+            return [Result('error', stmt, error=error)], False
+
+    db = dataset._database
+    if db.is_closed():
+        db.connect()
+
+    results = []
+    committed = False
+    with db.manual_commit():
+        db.begin()
+        try:
+            for stmt in statements:
+                result = run_one(dataset, stmt, page_size=page_size)
+                results.append(result)
+                if result.kind == 'error':
+                    break
+            else:
+                if commit:
+                    try:
+                        db.commit()
+                    except Exception as exc:
+                        # e.g. a deferred constraint checked at commit time.
+                        results.append(Result('error', 'COMMIT',
+                                              error=str(exc)))
+                    else:
+                        committed = True
+        finally:
+            if not committed:
+                try:
+                    db.rollback()
+                except Exception:
+                    # sqlite may already have rolled the transaction back;
+                    # closing the connection finishes the job either way.
+                    pass
+    return results, committed
 
 
 def is_read(dataset, sql):

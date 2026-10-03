@@ -1,11 +1,20 @@
+import http.client
+import http.cookiejar
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
+from werkzeug.serving import make_server
 
 from sqlite_web import sqlite_web as sw
 from sqlite_web.executor import Result
@@ -14,6 +23,7 @@ from sqlite_web.executor import key_decode
 from sqlite_web.executor import key_encode
 from sqlite_web.executor import run_one
 from sqlite_web.executor import run_script
+from sqlite_web.executor import run_script_atomic
 from sqlite_web.executor import split_statements
 from sqlite_web.executor import wrap
 
@@ -182,6 +192,140 @@ class TestRunScript(BaseExecutorTestCase):
             self.assertEqual(
                 ds.query('SELECT COUNT(*) FROM t1').fetchone()[0], 0)
             db.close()
+
+
+class BaseFileExecutorTestCase(unittest.TestCase):
+    # File-backed so rollback is observable across connections and in the
+    # bytes on disk, the way the query page exercises it over HTTP.
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, 'exec.db')
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, '
+                     'username TEXT)')
+        conn.executemany('INSERT INTO users (username) VALUES (?)',
+                         [('huey',), ('mickey',), ('zaizee',)])
+        conn.commit()
+        conn.close()
+        self.db = SqliteDatabase(self.db_path)
+        self.dataset = DataSet(self.db)
+
+    def tearDown(self):
+        if not self.db.is_closed():
+            self.db.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def user_count(self):
+        return self.dataset.query('SELECT COUNT(*) FROM users').fetchone()[0]
+
+    def file_bytes(self):
+        with open(self.db_path, 'rb') as f:
+            return f.read()
+
+
+class TestRunScriptAtomic(BaseFileExecutorTestCase):
+    def run_atomic(self, script, **kwargs):
+        return run_script_atomic(self.dataset, split_statements(script),
+                                 **kwargs)
+
+    def test_commit_applies_everything(self):
+        results, committed = self.run_atomic(
+            "INSERT INTO users (username) VALUES ('a');"
+            'CREATE TABLE t2 (id INTEGER);'
+            "UPDATE users SET username = 'b' WHERE id = 1;")
+        self.assertTrue(committed)
+        self.assertEqual([r.kind for r in results], ['affected'] * 3)
+        self.assertFalse(self.db.connection().in_transaction)
+        self.assertEqual(self.user_count(), 4)
+        self.assertEqual(run_one(self.dataset, 'SELECT * FROM t2').kind,
+                         'rows')
+        self.assertEqual(
+            self.dataset.query('SELECT username FROM users WHERE id = 1')
+            .fetchone()[0], 'b')
+
+    def test_statements_report_order_and_elapsed(self):
+        results, _ = self.run_atomic(
+            "INSERT INTO users (username) VALUES ('a');"
+            'SELECT COUNT(*) FROM users;')
+        self.assertEqual([r.statement for r in results],
+                         ["INSERT INTO users (username) VALUES ('a');",
+                          'SELECT COUNT(*) FROM users;'])
+        for r in results:
+            self.assertIsNotNone(r.elapsed)
+            self.assertGreaterEqual(r.elapsed, 0)
+
+    def test_error_rolls_back_everything(self):
+        results, committed = self.run_atomic(
+            "INSERT INTO users (username) VALUES ('a');"
+            'CREATE TABLE t2 (id INTEGER);'
+            'SELECT nocolumn FROM users;'
+            "INSERT INTO users (username) VALUES ('never');")
+        self.assertFalse(committed)
+        self.assertEqual([r.kind for r in results],
+                         ['affected', 'affected', 'error'])
+        self.assertIn('nocolumn', results[-1].error)
+        self.assertFalse(self.db.connection().in_transaction)
+        # Data and DDL both reverted to the pre-script state.
+        self.assertEqual(self.user_count(), 3)
+        self.assertEqual(run_one(self.dataset, 'SELECT * FROM t2').kind,
+                         'error')
+
+    def test_preview_rolls_back_successful_script(self):
+        before = self.file_bytes()
+        results, committed = self.run_atomic(
+            "INSERT INTO users (username) VALUES ('a');"
+            'CREATE TABLE t2 (id INTEGER);',
+            commit=False)
+        self.assertFalse(committed)
+        self.assertEqual([r.kind for r in results], ['affected', 'affected'])
+        self.assertEqual(self.user_count(), 3)
+        self.assertEqual(self.file_bytes(), before)
+
+    def test_preview_and_commit_agree(self):
+        script = ("INSERT INTO users (username) VALUES ('a');"
+                  'SELECT COUNT(*) FROM users;')
+        preview, _ = self.run_atomic(script, commit=False)
+        committed_results, committed = self.run_atomic(script, commit=True)
+        self.assertTrue(committed)
+        self.assertEqual([r.kind for r in preview],
+                         [r.kind for r in committed_results])
+        # The SELECT saw the same rows in the dry run and the real run.
+        self.assertEqual(preview[-1].rows, committed_results[-1].rows)
+        self.assertEqual(self.user_count(), 4)
+
+    def test_transaction_control_rejected(self):
+        for keyword in ('BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT s1',
+                        'RELEASE s1', 'END'):
+            results, committed = self.run_atomic(
+                "INSERT INTO users (username) VALUES ('a'); %s;" % keyword)
+            self.assertFalse(committed, keyword)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].kind, 'error')
+            self.assertIn('transaction', results[0].error.lower())
+            self.assertEqual(self.user_count(), 3)
+        self.assertFalse(self.db.connection().in_transaction)
+
+    def test_crash_mid_script_rolls_back(self):
+        # A failure that is not a sql error (process dies, page closed):
+        # the open transaction must not leave partial changes behind.
+        from sqlite_web import executor
+        calls = []
+        real_run_one = executor.run_one
+        def flaky(dataset, sql, **kwargs):
+            calls.append(sql)
+            if len(calls) == 2:
+                raise RuntimeError('simulated crash')
+            return real_run_one(dataset, sql, **kwargs)
+        executor.run_one = flaky
+        try:
+            self.assertRaises(
+                RuntimeError, self.run_atomic,
+                "INSERT INTO users (username) VALUES ('a');"
+                "INSERT INTO users (username) VALUES ('b');")
+        finally:
+            executor.run_one = real_run_one
+        self.assertFalse(self.db.connection().in_transaction)
+        self.assertEqual(self.user_count(), 3)
 
 
 class TestIsRead(BaseExecutorTestCase):
@@ -981,6 +1125,251 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+class LiveHttpClient:
+    # Minimal cookie-aware client for talking to a real server over TCP.
+    def __init__(self, base):
+        self.base = base
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+    def _open(self, path, data=None):
+        body = None
+        if data is not None:
+            body = urllib.parse.urlencode(data).encode('utf8')
+        try:
+            resp = self.opener.open(self.base + path, data=body)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+        return resp.status, resp.read()
+
+    def get(self, path):
+        return self._open(path)
+
+    def post(self, path, data):
+        return self._open(path, data)
+
+
+class BaseLiveServerTestCase(BaseAppTestCase):
+    # Serves the app on a real socket so requests exercise the full HTTP
+    # stack, including request teardown in worker threads.
+    def setUp(self):
+        super().setUp()
+        self.server = make_server('127.0.0.1', 0, sw.app, threaded=True)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        self.base = 'http://127.0.0.1:%d' % self.port
+        self.http = LiveHttpClient(self.base)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join()
+        super().tearDown()
+
+    def spy_on_close(self):
+        # Records, per request teardown, whether the connection really was
+        # closed. Runs in the worker thread, where the connection lived.
+        dataset = list(sw.datasets.values())[0]
+        closed = []
+        real_close = dataset.close
+        def spy():
+            real_close()
+            closed.append(dataset._database.is_closed())
+        dataset.close = spy
+        return closed, real_close, dataset
+
+
+class TestAtomicScriptHttp(BaseLiveServerTestCase):
+    SCRIPT = ("INSERT INTO users (username) VALUES ('w1');"
+              "UPDATE users SET username = 'renamed' WHERE id = 1;"
+              'CREATE TABLE added (id INTEGER);')
+
+    def test_script_applies_atomically(self):
+        status, body = self.http.post('/query/', {'sql': self.SCRIPT})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Applied 3 statements', body)
+        # Statements are listed in order, each with its own timing.
+        results_html = body[body.index(b'Applied 3 statements'):]
+        self.assertLess(results_html.index(b'w1'),
+                        results_html.index(b'renamed'))
+        self.assertLess(results_html.index(b'renamed'),
+                        results_html.index(b'added'))
+        self.assertEqual(results_html.count(b'text-muted small'), 3)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+        self.assertEqual(
+            self.dbrows('SELECT username FROM users WHERE id = 1'),
+            [('renamed',)])
+        self.assertTrue(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE name = 'added'"))
+
+    def test_failed_script_rolls_back(self):
+        status, body = self.http.post('/query/', {'sql':
+            "INSERT INTO users (username) VALUES ('a');"
+            'CREATE TABLE t_rb (id INTEGER);'
+            'SELECT nocolumn FROM users;'
+            "INSERT INTO users (username) VALUES ('never');"})
+        self.assertEqual(status, 200)
+        # The failure stays on the page: which statement, what error.
+        self.assertIn(b'Statement 3 failed', body)
+        self.assertIn(b'rolled back', body)
+        self.assertIn(b'nocolumn', body)
+        self.assertIn(b'1 remaining', body)
+        # The database is back to its pre-script state, DDL included.
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+        self.assertFalse(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE name = 't_rb'"))
+
+    def test_preview_does_not_touch_the_database_file(self):
+        with open(self.db_path, 'rb') as f:
+            before = f.read()
+        status, body = self.http.post('/query/', {
+            'sql': self.SCRIPT, 'preview': '1'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Preview', body)
+        self.assertIn(b'Nothing was applied', body)
+        self.assertIn(b'>Commit<', body)
+        self.assertEqual(body.count(b'text-muted small'), 3)
+        with open(self.db_path, 'rb') as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_preview_failure_offers_no_commit(self):
+        with open(self.db_path, 'rb') as f:
+            before = f.read()
+        status, body = self.http.post('/query/', {'sql':
+            "INSERT INTO users (username) VALUES ('ghost');"
+            'SELECT nocolumn FROM users;',
+            'preview': '1'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Preview: statement 2 failed', body)
+        self.assertNotIn(b'>Commit<', body)
+        with open(self.db_path, 'rb') as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_preview_then_commit_applies_and_agrees(self):
+        script = ("INSERT INTO users (username) VALUES ('p1');"
+                  'SELECT COUNT(*) AS n FROM users;')
+        status, preview = self.http.post('/query/', {'sql': script,
+                                                     'preview': '1'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Nothing was applied', preview)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+        status, committed = self.http.post('/query/', {'sql': script})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Applied 2 statements', committed)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+        # The SELECT returned the same count in preview and in the commit.
+        count_cell = re.compile(rb'<td class="num">\s*(\d+)\s*</td>')
+        self.assertEqual(count_cell.findall(preview), [b'4'])
+        self.assertEqual(count_cell.findall(committed), [b'4'])
+
+    def test_single_statement_stays_one_step(self):
+        status, body = self.http.post('/query/', {'sql':
+            "INSERT INTO users (username) VALUES ('solo')"})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Rows modified', body)
+        self.assertNotIn(b'Nothing was applied', body)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+
+    def test_transaction_control_script_rejected(self):
+        status, body = self.http.post('/query/', {'sql':
+            "BEGIN; INSERT INTO users (username) VALUES ('x'); COMMIT;"})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Transaction-control', body)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_bookmarked_get_urls_still_work(self):
+        # A bookmarked write does not execute on GET.
+        status, body = self.http.get('/query/?sql=' +
+                                     urllib.parse.quote('DELETE FROM users'))
+        self.assertEqual(status, 200)
+        self.assertIn(b'Press Execute', body)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+        # A bookmarked read runs as before.
+        status, body = self.http.get('/query/?sql=' +
+                                     urllib.parse.quote('SELECT * FROM users'))
+        self.assertEqual(status, 200)
+        self.assertIn(b'huey', body)
+
+    def test_export_still_works(self):
+        status, body = self.http.post('/query/', {
+            'sql': 'SELECT * FROM users ORDER BY id', 'export_csv': '1'})
+        self.assertEqual(status, 200)
+        self.assertIn(b'huey', body)
+
+    def test_concurrent_scripts_do_not_interleave(self):
+        script_a = ';'.join(
+            "INSERT INTO users (username) VALUES ('a-%d')" % i
+            for i in range(10))
+        script_b = ';'.join(
+            "INSERT INTO users (username) VALUES ('b-%d')" % i
+            for i in range(10))
+        outcomes = {}
+        def run(name, script):
+            client = LiveHttpClient(self.base)  # One "tab" per client.
+            outcomes[name] = client.post('/query/', {'sql': script})
+        threads = [threading.Thread(target=run, args=('a', script_a)),
+                   threading.Thread(target=run, args=('b', script_b))]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        for name, marker, other in (('a', b'a-5', b'b-5'),
+                                    ('b', b'b-5', b'a-5')):
+            status, body = outcomes[name]
+            self.assertEqual(status, 200)
+            self.assertIn(b'Applied 10 statements', body)
+            self.assertIn(marker, body)
+            self.assertNotIn(other, body)
+        # Both scripts applied in full; sqlite serialized the transactions.
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 23)
+        self.assertEqual(self.dbrows(
+            "SELECT COUNT(*) FROM users WHERE username LIKE 'a-%'")[0][0], 10)
+        self.assertEqual(self.dbrows(
+            "SELECT COUNT(*) FROM users WHERE username LIKE 'b-%'")[0][0], 10)
+
+    def test_connections_closed_after_requests(self):
+        closed, real_close, dataset = self.spy_on_close()
+        try:
+            self.http.get('/query/?sql=' +
+                          urllib.parse.quote('SELECT * FROM users'))
+            self.http.post('/query/', {'sql': self.SCRIPT})
+            self.http.post('/query/', {'sql': self.SCRIPT, 'preview': '1'})
+        finally:
+            dataset.close = real_close
+        self.assertGreaterEqual(len(closed), 3)
+        self.assertTrue(all(closed))
+
+    def test_client_disconnect_mid_script_leaves_no_partial_state(self):
+        # The slow CTE keeps the script running while the client hangs up.
+        script = (
+            "INSERT INTO users (username) VALUES ('slow');"
+            'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c '
+            'WHERE x < 2000000) SELECT COUNT(*) FROM c;'
+            'SELECT nocolumn FROM users;')
+        closed, real_close, dataset = self.spy_on_close()
+        try:
+            conn = http.client.HTTPConnection('127.0.0.1', self.port,
+                                              timeout=30)
+            conn.request('POST', '/query/',
+                         body=urllib.parse.urlencode({'sql': script}),
+                         headers={'Content-Type':
+                                  'application/x-www-form-urlencoded'})
+            conn.close()  # Walk away without reading the response.
+            deadline = time.time() + 30
+            while not closed and time.time() < deadline:
+                time.sleep(0.05)
+        finally:
+            dataset.close = real_close
+        # The request ran to completion server-side: the script failed,
+        # rolled back, and the connection was closed by teardown.
+        self.assertTrue(closed)
+        self.assertTrue(all(closed))
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
 
 
 if __name__ == '__main__':

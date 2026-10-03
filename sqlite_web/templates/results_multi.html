@@ -1,6 +1,37 @@
+{% if script_preview %}
+  {% if script_ok %}
+    <div class="alert alert-info">
+      Preview: {% if results|length == 1 %}1 statement{% else %}{{ results|length }} statements{% endif %}
+      ran inside a transaction that was rolled back. Nothing was applied.
+    </div>
+    <form action="." class="mb-3" method="post">
+      <input name="sql" type="hidden" value="{{ sql }}" />
+      <button class="btn btn-primary" type="submit">Commit</button>
+    </form>
+  {% else %}
+    <div class="alert alert-warning">
+      Preview: statement {{ results|length }} failed. Nothing was applied.
+    </div>
+  {% endif %}
+{% elif script_committed %}
+  <div class="alert alert-success">
+    Applied {% if results|length == 1 %}1 statement{% else %}{{ results|length }} statements{% endif %}.
+  </div>
+{% else %}
+  <div class="alert alert-warning">
+    Statement {{ results|length }} failed. Everything was rolled back; no
+    changes were applied.
+  </div>
+{% endif %}
 {% for result in results %}
   <div class="script-result">
-    <p><code>{{ result.statement|truncate(120, True) }}</code></p>
+    <p>
+      <strong>{{ loop.index }}.</strong>
+      <code>{{ result.statement|truncate(120, True) }}</code>
+      {% if result.elapsed is not none %}
+        <span class="text-muted small">{{ '%.1f'|format(result.elapsed * 1000) }}&nbsp;ms</span>
+      {% endif %}
+    </p>
     {% set in_script = True %}
     {% include "results.html" %}
   </div>
