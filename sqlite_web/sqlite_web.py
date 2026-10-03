@@ -13,6 +13,7 @@ import operator
 import optparse
 import os
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -78,12 +79,16 @@ from playhouse.migrate import migrate
 
 try:
     from sqlite_web.executor import (
-        Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        Result, execute_script, find_attach, find_transaction_control,
+        is_read, key_decode, key_encode, meaningful_statements,
+        preview_script, run_one, run_script, split_statements,
+        strip_comments, wrap)
 except ImportError:
     from executor import (
-        Result, is_read, key_decode, key_encode, run_one, run_script,
-        split_statements, wrap)
+        Result, execute_script, find_attach, find_transaction_control,
+        is_read, key_decode, key_encode, meaningful_statements,
+        preview_script, run_one, run_script, split_statements,
+        strip_comments, wrap)
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -104,6 +109,13 @@ app.config.from_object(__name__)
 datasets = {}
 datasets_lock = threading.Lock()
 dataset_config = {}
+
+# Issued script previews awaiting confirmation:
+# token -> {dataset, sql, fingerprint, expires}. Single use, bounded size.
+previews = {}
+previews_lock = threading.Lock()
+PREVIEW_TTL = datetime.timedelta(minutes=30)
+PREVIEW_LIMIT = 100
 
 #
 # Database metadata objects.
@@ -339,6 +351,74 @@ def get_dataset():
         g.dataset = datasets[dataset_key]
     return g.dataset
 
+
+def db_fingerprint(dataset):
+    # Detect changes between preview and commit. mtime+size cover the
+    # data file (and WAL, if present); schema_version covers any change
+    # whose page writes happen to leave the size untouched.
+    path = dataset.filename
+    stats = []
+    for target in (path, path + '-wal'):
+        try:
+            stat = os.stat(target)
+        except OSError:
+            stats.append(None)
+        else:
+            stats.append((stat.st_mtime_ns, stat.st_size))
+    try:
+        schema_version = dataset.query('PRAGMA schema_version').fetchone()[0]
+    except Exception:
+        schema_version = None
+    return {'stats': stats, 'schema_version': schema_version}
+
+
+def _prune_previews(now):
+    expired = [t for t, entry in previews.items()
+               if entry['expires'] <= now]
+    for token in expired:
+        previews.pop(token, None)
+
+
+def store_preview(dataset_key, sql, fingerprint):
+    token = secrets.token_urlsafe(24)
+    now = datetime.datetime.now()
+    with previews_lock:
+        _prune_previews(now)
+        previews[token] = {
+            'dataset': dataset_key,
+            'sql': sql,
+            'fingerprint': fingerprint,
+            'expires': now + PREVIEW_TTL,
+        }
+        # Bound the registry if many tabs previews pile up.
+        if len(previews) > PREVIEW_LIMIT:
+            oldest = sorted(previews, key=lambda t: previews[t]['expires'])
+            for token in oldest[:len(previews) - PREVIEW_LIMIT]:
+                previews.pop(token, None)
+    return token
+
+
+def take_preview(token, dataset_key, sql):
+    now = datetime.datetime.now()
+    with previews_lock:
+        entry = previews.pop(token, None)
+        _prune_previews(now)
+    if entry is None:
+        return None, 'Preview expired or was already used. Preview again.'
+    if entry['dataset'] != dataset_key or entry['sql'] != sql:
+        return None, 'The script changed since it was previewed. Preview again.'
+    return entry, None
+
+
+def fingerprint_matches(entry, dataset):
+    # Same database, same shape as at preview time.
+    current = None
+    try:
+        current = db_fingerprint(dataset)
+    except Exception:
+        return False
+    return current == entry['fingerprint']
+
 def quote_ident(name):
     return '"%s"' % name.replace('"', '""')
 
@@ -555,8 +635,8 @@ def _query_view(template, table=None):
             else:
                 flash('Successfully deleted %s row(s)' % n, 'success')
 
-    statements = split_statements(sql) if sql.strip() else []
-    single_read = len(statements) == 1 and is_read(dataset, sql)
+    statements = meaningful_statements(split_statements(sql)) if sql.strip() else []
+    single_read = len(statements) == 1 and is_read(dataset, statements[0])
     # The bulk form re-submits the sql, so only offer it for reads.
     allow_bulk = allow_bulk and single_read
 
@@ -568,6 +648,8 @@ def _query_view(template, table=None):
             return export(model_class.raw(qsql).dicts(), export_format, table)
 
     result = results = total = total_pages = None
+    preview_token = None
+    commit_status = None
     rpp = app.config['QUERY_ROWS_PER_PAGE']
     if statements and export_format is None:
         if request.method == 'GET' and not single_read:
@@ -581,7 +663,8 @@ def _query_view(template, table=None):
             result = run_one(dataset, run_sql, page=page, page_size=rpp,
                              ordering=ordering)
         else:
-            results = run_script(dataset, statements, page_size=rpp)
+            results, preview_token, commit_status = _run_script_request(
+                dataset, sql, statements, rpp)
 
     if (result is not None and result.kind == 'rows' and allow_detail and
             not explain and not is_composite_pk and
@@ -606,6 +689,7 @@ def _query_view(template, table=None):
         allow_bulk=allow_bulk,
         allow_detail=allow_detail,
         allow_edit=allow_edit,
+        commit_status=commit_status,
         default_sql=default_sql,
         error=error,
         fk_lookup=fk_lookup,
@@ -613,6 +697,7 @@ def _query_view(template, table=None):
         page=page,
         page_start=(page - 1) * rpp + 1,
         paginate=single_read and not explain,
+        preview_token=preview_token,
         query_images=get_query_images(),
         result=result,
         results=results,
@@ -622,6 +707,105 @@ def _query_view(template, table=None):
         total=total,
         total_pages=total_pages,
         total_statements=len(statements))
+
+def _run_script_request(dataset, sql, statements, page_size):
+    """Handle Execute / Preview / Commit for a multi-statement script.
+
+    Returns (results, preview_token, status) where status is one of
+    'preview', 'committed', 'rolled-back' or None for plain read runs.
+    """
+    action = request.form.get('script_action')
+    dataset_key = session.get('dataset')
+
+    # Refuse up front, before any work or snapshot. Scripts that manage
+    # their own transaction cannot be wrapped in ours.
+    controlled = find_transaction_control(statements)
+    if controlled is not None:
+        results, _ = [Result(
+            'error', controlled,
+            error=('Script manages its own transaction (BEGIN/COMMIT/'
+                   'ROLLBACK/SAVEPOINT). Remove transaction control '
+                   'statements so the script can be run atomically.'))], False
+        return results, None, None
+
+    # ATTACH reaches files outside this database; those writes are not
+    # covered by our transaction or by the preview snapshot.
+    attached = find_attach(statements)
+    if attached is not None:
+        results, _ = [Result(
+            'error', attached,
+            error=('ATTACH/DETACH is not supported: an attached database '
+                   'commits independently and cannot be part of an atomic '
+                   'script.'))], False
+        return results, None, None
+
+    all_read = all(is_read(dataset, stmt) for stmt in statements)
+
+    if all_read:
+        # Read-only scripts have nothing to preview: run directly, but
+        # still wrapped so each statement reports timings.
+        results, _ = execute_script(dataset, statements, page_size,
+                                    atomic=False)
+        return results, None, None
+
+    if dataset.is_readonly:
+        flash('Database is opened read-only; this script contains a '
+              'statement that writes.', 'danger')
+        results = run_script(dataset, statements, page_size=page_size)
+        return results, None, None
+
+    if action == 'commit':
+        token = request.form.get('preview_token') or ''
+        entry, message = take_preview(token, dataset_key, sql)
+        if entry is None:
+            flash(message, 'warning')
+            # Show the preview results again instead of touching the db.
+            results, wrote = _safe_preview(dataset, statements, page_size)
+            if results is not None:
+                preview_token = store_preview(
+                    dataset_key, sql, db_fingerprint(dataset))
+                return results, preview_token, 'preview'
+            return [], None, None
+        if not fingerprint_matches(entry, dataset):
+            flash('The database changed after the preview. Preview again '
+                  'before committing.', 'warning')
+            results, wrote = _safe_preview(dataset, statements, page_size)
+            if results is not None:
+                preview_token = store_preview(
+                    dataset_key, sql, db_fingerprint(dataset))
+                return results, preview_token, 'preview'
+            return [], None, None
+
+        results, wrote = execute_script(dataset, statements, page_size,
+                                        atomic=True)
+        if any(r.kind == 'error' for r in results):
+            flash('The script failed; all statements were rolled back.',
+                  'danger')
+            return results, None, 'rolled-back'
+        flash('Script committed: %d statement(s) applied together.'
+              % len(results), 'success')
+        return results, None, 'committed'
+
+    # Default: preview against an isolated snapshot.
+    results, wrote = _safe_preview(dataset, statements, page_size)
+    if results is None:
+        return [], None, None
+    preview_token = store_preview(dataset_key, sql, db_fingerprint(dataset))
+    return results, preview_token, 'preview'
+
+
+def _safe_preview(dataset, statements, page_size):
+    # Returns (results, wrote), or (None, False) if the snapshot failed.
+    try:
+        return preview_script(
+            dataset.filename, statements, page_size,
+            foreign_keys=bool(dataset_config.get('foreign_keys')),
+            extensions=dataset_config.get('extensions') or (),
+            startup_hook=dataset_config.get('startup_hook'))
+    except Exception as exc:
+        app.logger.exception('Preview failed.')
+        flash('Preview failed: %s' % exc, 'danger')
+        return None, False
 
 @app.route('/query/', methods=['GET', 'POST'])
 def generic_query():

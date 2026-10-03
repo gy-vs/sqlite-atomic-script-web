@@ -1,6 +1,51 @@
+{% if results %}
+  {% if commit_status == 'preview' and preview_token %}
+    <div class="alert alert-info">
+      <strong>Preview.</strong> The statements below ran against a temporary
+      copy of the database — nothing was changed. Review the results, then
+      commit to apply them together, or edit the script and preview again.
+    </div>
+  {% elif commit_status == 'committed' %}
+    <div class="alert alert-success">
+      <strong>Committed.</strong> All {{ results|length }} statement(s) were
+      applied together.
+    </div>
+  {% elif commit_status == 'rolled-back' %}
+    <div class="alert alert-danger">
+      <strong>Rolled back.</strong> A statement failed, so every earlier
+      statement in the script was undone. The database is unchanged.
+    </div>
+  {% endif %}
+
+  {% if commit_status == 'preview' and preview_token and not dataset.is_readonly %}
+    <form action="." id="commit-form" method="post" role="form">
+      <input name="sql" type="hidden" value="{{ sql }}" />
+      <input name="script_action" type="hidden" value="commit" />
+      <input name="preview_token" type="hidden" value="{{ preview_token }}" />
+      <button class="btn btn-success" type="submit" id="commit-button">
+        Commit script ({{ results|length }} statements)
+      </button>
+    </form>
+    <hr />
+  {% endif %}
+{% endif %}
+
 {% for result in results %}
-  <div class="script-result">
-    <p><code>{{ result.statement|truncate(120, True) }}</code></p>
+  <div class="script-result{% if result.kind == 'error' %} border-danger{% endif %}">
+    <p>
+      <span class="badge badge-secondary">{{ loop.index }}/{{ results|length }}</span>
+      <code>{{ result.statement|truncate(120, True) }}</code>
+      <small class="text-muted">{{ '%.2f'|format(result.duration) }} ms</small>
+      {% if result.kind == 'error' %}
+        <span class="badge badge-danger">error</span>
+      {% elif result.kind == 'affected' %}
+        <span class="badge badge-primary">
+          {% if result.affected >= 0 %}{{ result.affected }} row(s){% else %}done{% endif %}
+        </span>
+      {% else %}
+        <span class="badge badge-secondary">{{ result.rows|length }} row(s)</span>
+      {% endif %}
+    </p>
     {% set in_script = True %}
     {% include "results.html" %}
   </div>

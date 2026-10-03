@@ -1,10 +1,12 @@
 {% if result.kind == 'error' %}
   <div class="alert alert-danger"><code>{{ result.error }}</code></div>
 {% elif result.kind == 'affected' %}
-  {% if result.affected >= 0 %}
-    <p>Rows modified: <code>{{ result.affected }}</code></p>
-  {% else %}
-    <p>Done.</p>
+  {% if not in_script %}
+    {% if result.affected >= 0 %}
+      <p>Rows modified: <code>{{ result.affected }}</code></p>
+    {% else %}
+      <p>Done.</p>
+    {% endif %}
   {% endif %}
 {% elif not result.rows %}
   <p>Empty result set.</p>

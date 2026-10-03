@@ -1,20 +1,33 @@
+import glob
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
 
 from sqlite_web import sqlite_web as sw
+from sqlite_web import executor as executor_module
 from sqlite_web.executor import Result
+from sqlite_web.executor import execute_script
+from sqlite_web.executor import find_attach
+from sqlite_web.executor import find_transaction_control
 from sqlite_web.executor import is_read
 from sqlite_web.executor import key_decode
 from sqlite_web.executor import key_encode
+from sqlite_web.executor import meaningful_statements
+from sqlite_web.executor import preview_script
 from sqlite_web.executor import run_one
 from sqlite_web.executor import run_script
 from sqlite_web.executor import split_statements
+from sqlite_web.executor import strip_comments
 from sqlite_web.executor import wrap
 
 
@@ -182,6 +195,274 @@ class TestRunScript(BaseExecutorTestCase):
             self.assertEqual(
                 ds.query('SELECT COUNT(*) FROM t1').fetchone()[0], 0)
             db.close()
+
+
+class TestExecuteScript(BaseExecutorTestCase):
+    def run_atomic(self, script, **kwargs):
+        return execute_script(self.dataset, split_statements(script), **kwargs)
+
+    def test_commit_applies_everything(self):
+        results, wrote = self.run_atomic(
+            "INSERT INTO users (username) VALUES ('a');"
+            "INSERT INTO users (username) VALUES ('b');"
+            'SELECT COUNT(*) FROM users;')
+        self.assertEqual([r.kind for r in results],
+                         ['affected', 'affected', 'rows'])
+        self.assertTrue(wrote)
+        self.assertFalse(self.db.connection().in_transaction)
+        self.assertEqual(self.user_count(), 5)
+        self.assertEqual(results[-1].rows, [(5,)])
+        for result in results:
+            self.assertGreaterEqual(result.duration, 0)
+
+    def test_error_rolls_back_every_statement(self):
+        results, wrote = self.run_atomic(
+            "INSERT INTO users (username) VALUES ('a');"
+            'CREATE TABLE t2 (id INTEGER);'
+            'SELECT nocolumn FROM users;'
+            "INSERT INTO users (username) VALUES ('never');")
+        self.assertEqual([r.kind for r in results],
+                         ['affected', 'affected', 'error'])
+        self.assertFalse(wrote)
+        self.assertFalse(self.db.connection().in_transaction)
+        # Everything is undone, including the DDL.
+        self.assertEqual(self.user_count(), 3)
+        self.assertEqual(run_one(self.dataset,
+                                 "SELECT name FROM sqlite_master "
+                                 "WHERE name='t2'").rows, [])
+
+    def test_order_and_timing_reported(self):
+        results, _ = self.run_atomic(
+            'SELECT 1; SELECT 2; SELECT 3;')
+        self.assertEqual([r.rows for r in results], [[(1,)], [(2,)], [(3,)]])
+        self.assertTrue(all(r.duration >= 0 for r in results))
+
+    def test_transaction_control_refused(self):
+        results, wrote = self.run_atomic(
+            "BEGIN; INSERT INTO users (username) VALUES ('a'); COMMIT;")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].kind, 'error')
+        self.assertIn('transaction', results[0].error)
+        self.assertEqual(self.user_count(), 3)
+
+    def test_trigger_body_allowed(self):
+        results, wrote = self.run_atomic(
+            'CREATE TRIGGER trg AFTER INSERT ON users BEGIN '
+            'UPDATE users SET username = username WHERE 0; END;')
+        self.assertEqual([r.kind for r in results], ['affected'])
+
+    def test_savepoint_refused(self):
+        results, _ = self.run_atomic('SAVEPOINT x; INSERT INTO users (id) '
+                                     "VALUES (99); RELEASE SAVEPOINT x;")
+        self.assertEqual(results[0].kind, 'error')
+
+    def test_ddl_counts_as_write(self):
+        results, wrote = self.run_atomic('CREATE TABLE t2 (id INTEGER)')
+        self.assertEqual(results[0].kind, 'affected')
+        self.assertTrue(wrote)
+
+    def test_deferred_foreign_key_rolls_back_commit(self):
+        # FK enforcement is deferred to COMMIT by default; the failing
+        # commit must still undo every earlier statement.
+        self.db.pragma('foreign_keys', True, permanent=True)
+        self.dataset.query('CREATE TABLE parent (id INTEGER PRIMARY KEY)')
+        self.dataset.query('CREATE TABLE child (id INTEGER PRIMARY KEY, '
+                           'pid INTEGER REFERENCES parent(id))')
+        results, _ = self.run_atomic(
+            'INSERT INTO parent VALUES (1);'
+            'INSERT INTO child VALUES (1, 99);')
+        self.assertEqual([r.kind for r in results], ['affected', 'error'])
+        self.assertEqual(self.dataset.query(
+            'SELECT COUNT(*) FROM parent').fetchone()[0], 0)
+
+    def test_comment_only_chunk_ignored(self):
+        self.assertEqual(
+            meaningful_statements(split_statements('SELECT 1; -- done')),
+            ['SELECT 1;'])
+        results, _ = self.run_atomic('SELECT 1; -- done')
+        self.assertEqual([r.kind for r in results], ['rows'])
+
+    def test_strip_comments_preserves_strings(self):
+        sql = "SELECT '-- not a comment', 1; /* x */ SELECT 2;"
+        cleaned = strip_comments(sql)
+        self.assertIn("'-- not a comment'", cleaned)
+        self.assertNotIn('/* x */', cleaned)
+
+
+class TestPreviewScript(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, 'preview.db')
+        conn = sqlite3.connect(self.path)
+        conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)')
+        conn.executemany('INSERT INTO t (v) VALUES (?)',
+                         [('a',), ('b',), ('c',)])
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def file_state(self):
+        return (os.stat(self.path).st_mtime_ns, os.stat(self.path).st_size)
+
+    def test_preview_does_not_change_file(self):
+        before = self.file_state()
+        results, wrote = preview_script(
+            self.path,
+            split_statements("INSERT INTO t (v) VALUES ('z'); "
+                             'DELETE FROM t; '
+                             'CREATE TABLE x (id INTEGER); '
+                             'SELECT COUNT(*) FROM t;'))
+        self.assertEqual([r.kind for r in results],
+                         ['affected', 'affected', 'affected', 'rows'])
+        self.assertTrue(wrote)
+        self.assertEqual(before, self.file_state())
+        # Snapshot changes were visible within the preview.
+        self.assertEqual(results[-1].rows, [(0,)])
+        # Nothing reached the real file.
+        conn = sqlite3.connect(self.path)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM t').fetchone()[0],
+                         3)
+        self.assertIsNone(conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='x'").fetchone())
+        conn.close()
+
+    def test_preview_results_match_commit(self):
+        script = ("INSERT INTO t (v) VALUES ('d');"
+                  'UPDATE t SET v = upper(v);'
+                  'SELECT v FROM t ORDER BY id;')
+        preview, _ = preview_script(self.path, split_statements(script))
+
+        db = SqliteDatabase(self.path)
+        dataset = DataSet(db)
+        committed, _ = execute_script(dataset, split_statements(script))
+        db.close()
+
+        self.assertEqual([r.kind for r in preview],
+                         [r.kind for r in committed])
+        self.assertEqual(preview[-1].rows, committed[-1].rows)
+        self.assertEqual(preview[-1].rows,
+                         [('A',), ('B',), ('C',), ('D',)])
+
+    def test_preview_cleans_up_connections_and_files(self):
+        created = []
+        original = executor_module.sqlite3.connect
+
+        def spy(*args, **kwargs):
+            conn = original(*args, **kwargs)
+            created.append(conn)
+            return conn
+
+        executor_module.sqlite3.connect = spy
+        try:
+            results, _ = preview_script(
+                self.path, split_statements("INSERT INTO t (v) "
+                                            "VALUES ('z'); SELECT 1;"))
+            self.assertEqual([r.kind for r in results], ['affected', 'rows'])
+        finally:
+            executor_module.sqlite3.connect = original
+
+        self.assertTrue(created)
+        for conn in created:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute('SELECT 1')
+        leftovers = glob.glob(os.path.join(tempfile.gettempdir(),
+                                           'sqlite-web-preview-*'))
+        self.assertEqual(leftovers, [])
+
+    def test_preview_error_leaves_real_file_unchanged(self):
+        before = self.file_state()
+        results, wrote = preview_script(
+            self.path,
+            split_statements("INSERT INTO t (v) VALUES ('z'); "
+                             'SELECT bad FROM t;'))
+        self.assertEqual(results[-1].kind, 'error')
+        self.assertEqual(before, self.file_state())
+        conn = sqlite3.connect(self.path)
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM t').fetchone()[0],
+                         3)
+        conn.close()
+        leftovers = glob.glob(os.path.join(tempfile.gettempdir(),
+                                           'sqlite-web-preview-*'))
+        self.assertEqual(leftovers, [])
+
+    def test_preview_includes_wal_pages(self):
+        # Keep a connection open so committed pages remain in the WAL.
+        holder = sqlite3.connect(self.path)
+        holder.execute('PRAGMA journal_mode=WAL')
+        holder.execute("INSERT INTO t (v) VALUES ('wal-row')")
+        holder.commit()
+        try:
+            results, _ = preview_script(
+                self.path, split_statements('SELECT COUNT(*) FROM t;'))
+            self.assertEqual(results[0].rows, [(4,)])
+        finally:
+            holder.close()
+
+
+class TestTransactionControlDetection(unittest.TestCase):
+    def test_detects_control_statements(self):
+        for script in ('BEGIN;', 'BEGIN IMMEDIATE;', 'COMMIT;', 'ROLLBACK;',
+                       'END;', 'SAVEPOINT x;', 'RELEASE x;'):
+            stmt = find_transaction_control(split_statements(script))
+            self.assertIsNotNone(stmt, script)
+
+    def test_trigger_body_is_not_control(self):
+        script = ('CREATE TRIGGER trg AFTER INSERT ON t '
+                 'BEGIN UPDATE t SET v=v; END;')
+        self.assertIsNone(find_transaction_control(split_statements(script)))
+        self.assertIsNone(find_transaction_control(
+            split_statements('DROP TRIGGER trg;')))
+
+    def test_commented_control_ignored(self):
+        self.assertIsNone(find_transaction_control(
+            split_statements('SELECT 1; -- COMMIT')))
+
+
+class TestAttachRejection(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, 'a.db')
+        conn = sqlite3.connect(self.path)
+        conn.execute('CREATE TABLE t (id INTEGER, note TEXT)')
+        conn.execute("INSERT INTO t VALUES (1, 'ATTACH DATABASE /x')")
+        conn.commit()
+        conn.close()
+        self.outside = os.path.join(self.tmp, 'outside.db')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_detector_distinguishes_syntax_from_literals(self):
+        self.assertIsNotNone(find_attach(split_statements(
+            "ATTACH DATABASE '%s' AS e;" % self.outside)))
+        self.assertIsNone(find_attach(split_statements(
+            "SELECT 'ATTACH' AS x;")))
+        self.assertIsNone(find_attach(split_statements(
+            "SELECT * FROM t WHERE note = 'BEGIN';")))
+        self.assertIsNone(find_attach(split_statements(
+            'SELECT 1; -- ATTACH me')))
+
+    def test_preview_attach_does_not_touch_other_files(self):
+        results, _ = preview_script(
+            self.path,
+            split_statements("ATTACH DATABASE '%s' AS e; "
+                             'CREATE TABLE e.x (id INTEGER);' % self.outside))
+        self.assertEqual(results[0].kind, 'error')
+        self.assertIn('ATTACH', results[0].error)
+        self.assertFalse(os.path.exists(self.outside))
+
+    def test_commit_attach_is_refused(self):
+        db = SqliteDatabase(self.path)
+        dataset = DataSet(db)
+        results, _ = execute_script(
+            dataset,
+            split_statements("ATTACH DATABASE '%s' AS e; "
+                             'SELECT 1;' % self.outside))
+        self.assertEqual(results[0].kind, 'error')
+        self.assertFalse(os.path.exists(self.outside))
+        db.close()
 
 
 class TestIsRead(BaseExecutorTestCase):
@@ -981,6 +1262,391 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+class AtomicScriptAppTestCase(BaseAppTestCase):
+    SCRIPT = ("INSERT INTO users (username) VALUES ('new1');"
+              "CREATE TABLE migrated (id INTEGER PRIMARY KEY, note TEXT);"
+              'SELECT COUNT(*) FROM users;')
+
+    def preview(self, script=None):
+        script = self.SCRIPT if script is None else script
+        r = self.client.post('/query/', data={'sql': script})
+        self.assertEqual(r.status_code, 200)
+        return r
+
+    @staticmethod
+    def token(response):
+        match = re.search(
+            rb'name="preview_token"[^>]*value="([^"]+)"', response.data)
+        assert match, 'no preview token in response'
+        return match.group(1).decode()
+
+    def commit(self, token, script=None):
+        script = self.SCRIPT if script is None else script
+        return self.client.post('/query/', data={
+            'sql': script,
+            'script_action': 'commit',
+            'preview_token': token})
+
+
+class TestAtomicScriptHttp(AtomicScriptAppTestCase):
+    def test_preview_shows_order_timing_results_and_commit_button(self):
+        r = self.preview()
+        self.assertIn(b'Preview.', r.data)
+        self.assertIn(b'Commit script', r.data)
+        # Every statement is listed in order with index and timing.
+        for badge in (b'1/3', b'2/3', b'3/3'):
+            self.assertIn(badge, r.data)
+        self.assertIn(b' ms</small>', r.data)
+        # Snapshot effects are visible within the preview results.
+        self.assertIn(b'<td class="num">\n              4\n', r.data)
+
+    def test_preview_does_not_modify_database_file(self):
+        before = (os.stat(self.db_path).st_mtime_ns,
+                  os.stat(self.db_path).st_size)
+        r = self.preview()
+        after = (os.stat(self.db_path).st_mtime_ns,
+                 os.stat(self.db_path).st_size)
+        self.assertEqual(before, after)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+        self.assertEqual(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE type='table' AND "
+            "name='migrated'"), [])
+        # Preview ran all three statements in order.
+        self.assertIn(b'1/3', r.data)
+
+    def test_commit_applies_all_statements_together(self):
+        token = self.token(self.preview())
+        r = self.commit(token)
+        self.assertIn(b'Committed.', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+        self.assertEqual(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE name='migrated'")[0][0],
+                         'migrated')
+        # Committed results show no second commit button.
+        self.assertNotIn(b'Commit script', r.data)
+
+    def test_preview_and_commit_show_same_results(self):
+        preview = self.preview()
+        token = self.token(preview)
+        committed = self.commit(token)
+        for needle in (b'new1', b'migrated', b'1/3'):
+            self.assertIn(needle, preview.data)
+            self.assertIn(needle, committed.data)
+
+    def test_failed_commit_rolls_back_and_reports_statement(self):
+        script = ("INSERT INTO users (username) VALUES ('half1');"
+                  "INSERT INTO users (username) VALUES ('half2');"
+                  'SELECT nocolumn FROM users;')
+        token = self.token(self.preview(script))
+        r = self.commit(token, script)
+        self.assertIn(b'Rolled back.', r.data)
+        self.assertIn(b'no such column: nocolumn', r.data)
+        # The error was the 3rd statement; its badge marks it.
+        self.assertIn(b'3/3', r.data)
+        self.assertIn(b'badge-danger', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+        # The fourth statement never ran at all.
+        self.assertEqual(self.dbrows(
+            "SELECT COUNT(*) FROM users WHERE username IN "
+            "('half1','half2')")[0][0], 0)
+
+    def test_failed_ddl_commit_rolls_back_schema(self):
+        script = ('CREATE TABLE mig (id INTEGER);'
+                  'ALTER TABLE users ADD COLUMN extra TEXT;'
+                  'SELECT broken FROM users;')
+        token = self.token(self.preview(script))
+        r = self.commit(token, script)
+        self.assertIn(b'Rolled back.', r.data)
+        self.assertEqual(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE name='mig'"), [])
+        columns = [row[1] for row in sqlite3.connect(
+            self.db_path).execute('PRAGMA table_info(users)')]
+        self.assertNotIn('extra', columns)
+
+    def test_token_is_single_use(self):
+        token = self.token(self.preview())
+        self.assertEqual(self.commit(token).status_code, 200)
+        r = self.commit(token)
+        self.assertIn(b'Preview expired or was already used', r.data)
+        # The reuse applied nothing extra.
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+
+    def test_commit_requires_a_preview(self):
+        r = self.client.post('/query/', data={
+            'sql': self.SCRIPT, 'script_action': 'commit'})
+        self.assertIn(b'Preview expired', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_modified_script_rejects_stale_token(self):
+        token = self.token(self.preview(self.SCRIPT))
+        other = ("INSERT INTO users (username) VALUES ('different');"
+                 'SELECT COUNT(*) FROM users;')
+        r = self.commit(token, other)
+        self.assertIn(b'changed since it was previewed', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_database_changed_between_preview_and_commit_is_refused(self):
+        token = self.token(self.preview(self.SCRIPT))
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO users (username) VALUES ('outside')")
+        conn.commit()
+        conn.close()
+        r = self.commit(token)
+        self.assertIn(b'changed after the preview', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+        # None of the previewed script landed.
+        self.assertEqual(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE name='migrated'"), [])
+
+    def test_transaction_control_is_refused_without_preview_changes(self):
+        script = ("BEGIN; INSERT INTO users (username) "
+                  "VALUES ('x'); COMMIT;")
+        r = self.client.post('/query/', data={'sql': script})
+        self.assertIn(b'manages its own transaction', r.data)
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_attach_is_refused_and_creates_no_other_file(self):
+        outside = os.path.join(self.tmp, 'attached.db')
+        script = ("ATTACH DATABASE '%s' AS ext; "
+                  'CREATE TABLE ext.x (id INTEGER);' % outside)
+        r = self.client.post('/query/', data={'sql': script})
+        self.assertIn(b'ATTACH', r.data)
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertFalse(os.path.exists(outside))
+
+    def test_attach_word_inside_string_is_allowed(self):
+        r = self.client.post('/query/', data={
+            'sql': "SELECT 'ATTACH DATABASE' AS x; SELECT 1;"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertIn(b'1/2', r.data)
+
+    def test_read_only_multi_runs_directly_without_preview(self):
+        r = self.client.post('/query/',
+                             data={'sql': 'SELECT 1; SELECT 2;'})
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertNotIn(b'Preview.', r.data)
+        self.assertIn(b'1/2', r.data)
+
+    def test_get_bookmark_still_renders(self):
+        r = self.client.get('/query/', query_string={'sql': 'SELECT 1'})
+        self.assertEqual(r.status_code, 200)
+
+    def test_single_write_still_one_click(self):
+        r = self.client.post('/query/', data={
+            'sql': "INSERT INTO users (username) VALUES ('solo')"})
+        self.assertIn(b'Rows modified', r.data)
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 4)
+
+    def test_preview_temporary_connections_are_closed(self):
+        created = []
+        original = executor_module.sqlite3.connect
+
+        def spy(*args, **kwargs):
+            conn = original(*args, **kwargs)
+            created.append(conn)
+            return conn
+
+        executor_module.sqlite3.connect = spy
+        try:
+            self.preview()
+        finally:
+            executor_module.sqlite3.connect = original
+
+        self.assertTrue(created)
+        for conn in created:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute('SELECT 1')
+
+    def test_preview_temporary_files_are_removed(self):
+        before = set(glob.glob(os.path.join(
+            tempfile.gettempdir(), 'sqlite-web-preview-*')))
+        self.preview()
+        after = set(glob.glob(os.path.join(
+            tempfile.gettempdir(), 'sqlite-web-preview-*')))
+        self.assertEqual(before, after)
+
+
+class TestConcurrentScriptCommits(AtomicScriptAppTestCase):
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('CREATE TABLE queue (id INTEGER PRIMARY KEY, '
+                     'batch TEXT)')
+        conn.commit()
+        conn.close()
+        # Independent clients act as two browser tabs.
+        self.client_b = sw.app.test_client()
+
+    def script_for(self, letter):
+        return ''.join(
+            "INSERT INTO queue (batch) VALUES ('%s%d');" % (letter, i)
+            for i in range(1, 6))
+
+    def preview_for(self, client, script):
+        r = client.post('/query/', data={'sql': script})
+        return self.token(r)
+
+    def test_two_tabs_cannot_interleave_statements(self):
+        sa, sb = self.script_for('a'), self.script_for('b')
+        ta = self.preview_for(self.client, sa)
+        tb = self.preview_for(self.client_b, sb)
+        outcomes = {}
+
+        def commit(client, token, script, name):
+            r = client.post('/query/', data={
+                'sql': script, 'script_action': 'commit',
+                'preview_token': token})
+            outcomes[name] = b'Committed.' in r.data
+
+        t1 = threading.Thread(target=commit,
+                              args=(self.client, ta, sa, 'a'))
+        t2 = threading.Thread(target=commit,
+                              args=(self.client_b, tb, sb, 'b'))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertTrue(all(outcomes.values()))
+        rows = self.dbrows('SELECT id, batch FROM queue ORDER BY id')
+        self.assertEqual(len(rows), 10)
+        # Each batch occupies one contiguous block of rowids: no mixing.
+        batches = [batch for _, batch in rows]
+        self.assertTrue(
+            batches == ['a%d' % i for i in range(1, 6)] +
+                       ['b%d' % i for i in range(1, 6)] or
+            batches == ['b%d' % i for i in range(1, 6)] +
+                       ['a%d' % i for i in range(1, 6)])
+
+
+class TestRealHttpServer(unittest.TestCase):
+    # Exercises the full stack over a real TCP socket: werkzeug serving
+    # HTTP, urllib posting forms, request teardown closing connections.
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, 'http.db')
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)')
+        conn.executemany('INSERT INTO users (name) VALUES (?)',
+                         [('a',), ('b',)])
+        conn.commit()
+        conn.close()
+
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path])
+        sw.app.config['TESTING'] = False
+        import werkzeug.serving
+        self.server = werkzeug.serving.make_server(
+            '127.0.0.1', 0, sw.app, threaded=True)
+        self.port = self.server.server_port
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        sw.app.config['TESTING'] = True
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def post(self, data, cookie=None):
+        import urllib.request
+        import urllib.parse
+        body = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(
+            'http://127.0.0.1:%d/query/' % self.port, data=body)
+        if cookie:
+            req.add_header('Cookie', cookie)
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            payload = resp.read()
+            set_cookie = resp.headers.get('Set-Cookie')
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            set_cookie = exc.headers.get('Set-Cookie')
+        return payload, set_cookie
+
+    def dbcount(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def token(payload):
+        match = re.search(rb'name="preview_token"[^>]*value="([^"]+)"',
+                          payload)
+        return match.group(1).decode()
+
+    def test_preview_then_commit_over_http(self):
+        script = ("INSERT INTO users (name) VALUES ('c');"
+                  "INSERT INTO users (name) VALUES ('d');")
+        before = (os.stat(self.db_path).st_mtime_ns,
+                  os.stat(self.db_path).st_size)
+        payload, _ = self.post({'sql': script})
+        self.assertIn(b'Preview.', payload)
+        self.assertEqual((os.stat(self.db_path).st_mtime_ns,
+                          os.stat(self.db_path).st_size), before)
+        self.assertEqual(self.dbcount(), 2)
+
+        payload, _ = self.post(
+            {'sql': script, 'script_action': 'commit',
+             'preview_token': self.token(payload)})
+        self.assertIn(b'Committed.', payload)
+        self.assertEqual(self.dbcount(), 4)
+
+    def test_failed_commit_rolls_back_over_http(self):
+        script = ("INSERT INTO users (name) VALUES ('x');"
+                  'SELECT broken FROM users;')
+        payload, _ = self.post({'sql': script})
+        payload, _ = self.post(
+            {'sql': script, 'script_action': 'commit',
+             'preview_token': self.token(payload)})
+        self.assertIn(b'Rolled back.', payload)
+        self.assertIn(b'no such column: broken', payload)
+        self.assertEqual(self.dbcount(), 2)
+
+    def test_connections_are_returned_after_requests(self):
+        # After a full HTTP cycle the per-request connection must be closed;
+        # repeatedly previewing must not accumulate open sqlite handles.
+        script = "INSERT INTO users (name) VALUES ('z'); SELECT 1;"
+        for _ in range(3):
+            payload, _ = self.post({'sql': script})
+            self.assertIn(b'Preview.', payload)
+        leftovers = glob.glob(os.path.join(tempfile.gettempdir(),
+                                           'sqlite-web-preview-*'))
+        self.assertEqual(leftovers, [])
+
+
+class TestPreviewOnReadOnlyDatabase(BaseAppTestCase):
+    def setUp(self):
+        super().setUp()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path], read_only=True)
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        super().tearDown()
+        sw.dataset_config['read_only'] = False
+
+    def test_write_script_is_refused_without_changes(self):
+        r = self.client.post('/query/', data={
+            'sql': "INSERT INTO users (username) VALUES ('x'); SELECT 1;"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'read-only', r.data)
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_read_script_runs(self):
+        r = self.client.post('/query/', data={
+            'sql': 'SELECT COUNT(*) FROM users; SELECT 1;'})
+        self.assertIn(b'1/2', r.data)
+        self.assertNotIn(b'Commit script', r.data)
+        self.assertIn(b'<td class="num">\n              3\n', r.data)
 
 
 if __name__ == '__main__':

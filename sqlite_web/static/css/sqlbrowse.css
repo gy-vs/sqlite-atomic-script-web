@@ -164,3 +164,20 @@ ul.pagination .page-item.disabled .page-link {
         overflow-y: auto;
     }
 }
+
+/* Multi-statement script results: one bordered block per statement. */
+.script-result {
+    border-left: 3px solid #dee2e6;
+    padding: 0.25rem 0 0.5rem 0.75rem;
+    margin-bottom: 1rem;
+}
+.script-result.border-danger {
+    border-left-color: #dc3545;
+    background-color: #fff5f5;
+}
+.script-result .badge + code {
+    margin-left: 0.25rem;
+}
+#commit-button {
+    margin-bottom: 0.5rem;
+}

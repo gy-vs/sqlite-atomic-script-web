@@ -11,5 +11,11 @@
       queryUrl: {{ url_for('generic_query')|tojson }},
       tableQueryUrl: {{ url_for('table_query', table='__TABLE__')|tojson }}
     });
+
+    /* A double-clicked Commit must not run the script twice. */
+    $('#commit-form').on('submit', function() {
+      $('#commit-button').prop('disabled', true)
+                         .text('Committing…');
+    });
   });
 </script>
